@@ -47,7 +47,7 @@ using namespace std;
 #define MAX(x,y) ((x) > (y) ? (x) : (y))
 #define MIN(x,y) ((x) < (y) ? (x) : (y))
 
-#define DEBUG_INVITE 0
+//#define DEBUG_INVITE
 
 Calltable *calltable;
 extern int calls;
