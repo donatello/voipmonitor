@@ -47,6 +47,8 @@ using namespace std;
 #define MAX(x,y) ((x) > (y) ? (x) : (y))
 #define MIN(x,y) ((x) < (y) ? (x) : (y))
 
+#define DEBUG_INVITE 0
+
 Calltable *calltable;
 extern int calls;
 extern int opt_saveSIP;	  	// save SIP packets to pcap file?
@@ -634,6 +636,9 @@ Call *process_packet(unsigned int saddr, int source, unsigned int daddr, int des
 					}
 					call->seeninvite = true;
 					telnumfilter->add_call_flags(&(call->flags), call->caller, call->called);
+#ifdef DEBUG_INVITE
+					syslog(LOG_NOTICE, "New call: srcip INET_NTOA[%u] dstip INET_NTOA[%u] From[%s] To[%s]\n", call->sipcallerip, call->sipcalledi, call->caller, call->called);
+#endif
 				}
 
 				// opening dump file
