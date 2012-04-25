@@ -47,7 +47,7 @@ using namespace std;
 #define MAX(x,y) ((x) > (y) ? (x) : (y))
 #define MIN(x,y) ((x) < (y) ? (x) : (y))
 
-//#define DEBUG_INVITE
+#define DEBUG_INVITE 1
 
 Calltable *calltable;
 extern int calls;
@@ -637,7 +637,7 @@ Call *process_packet(unsigned int saddr, int source, unsigned int daddr, int des
 					call->seeninvite = true;
 					telnumfilter->add_call_flags(&(call->flags), call->caller, call->called);
 #ifdef DEBUG_INVITE
-					syslog(LOG_NOTICE, "New call: srcip INET_NTOA[%u] dstip INET_NTOA[%u] From[%s] To[%s]\n", call->sipcallerip, call->sipcalledi, call->caller, call->called);
+					syslog(LOG_NOTICE, "New call: srcip INET_NTOA[%u] dstip INET_NTOA[%u] From[%s] To[%s]\n", call->sipcallerip, call->sipcalledip, call->caller, call->called);
 #endif
 				}
 
