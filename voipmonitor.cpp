@@ -23,6 +23,7 @@
 #include <unistd.h>
 #include <syslog.h>
 #include <sys/resource.h>
+#include <semaphore.h>
 
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -36,6 +37,11 @@
 #include "simpleini/SimpleIni.h"
 #include "manager.h"
 #include "filter_mysql.h"
+
+extern "C" {
+#include "liblfds.6/inc/liblfds.h"
+}
+
 
 using namespace std;
 
@@ -69,6 +75,7 @@ int opt_sip_register = 0;	// if == 1 save REGISTER messages
 int opt_ringbuffer = 10;	// ring buffer in MB 
 int opt_audio_format = FORMAT_WAV;	// define format for audio writing (if -W option)
 int opt_manager_port = 5029;	// manager api TCP port
+int opt_pcap_threaded = 0;	// run reading packets from pcap in one thread and process packets in another thread via queue
 
 char configfile[1024] = "";	// config file name
 
@@ -93,6 +100,10 @@ char ifname[1024];	// Specifies the name of the network device to use for
 int opt_promisc = 1;	// put interface to promisc mode?
 char pcapcommand[4092] = "";
 
+int rtp_threaded = 0; // do not enable this until it will be reworked to be thread safe
+int num_threads = 1; // this has to be 1 for now
+
+
 char opt_chdir[1024];
 
 IPfilter *ipfilter = NULL;		// IP filter based on MYSQL 
@@ -109,6 +120,18 @@ int terminating;		// if set to 1, worker thread will terminate
 char *sipportmatrix;		// matrix of sip ports to monitor
 
 pcap_t *handle = NULL;		// pcap handler 
+
+read_thread *threads;
+
+pthread_t pcap_read_thread;
+#ifdef QUEUE_MUTEX
+pthread_mutex_t readpacket_thread_queue_lock;
+sem_t readpacket_thread_semaphore;
+#endif
+
+#ifdef QUEUE_NONBLOCK
+struct queue_state *qs_readpacket_thread_queue = NULL;
+#endif
 
 void terminate2() {
 	terminating = 1;
@@ -305,6 +328,9 @@ int load_config(char *fname) {
 	if((value = ini.GetValue("general", "ringbuffer", NULL))) {
 		opt_ringbuffer = atoi(value);
 	}
+	if((value = ini.GetValue("general", "pcap-thread", NULL))) {
+		opt_pcap_threaded = yesno(value);
+	}
 	if((value = ini.GetValue("general", "rtp-firstleg", NULL))) {
 		opt_rtp_firstleg = yesno(value);
 	}
@@ -499,6 +525,7 @@ int main(int argc, char *argv[]) {
 	    {"config-file", 1, 0, '7'},
 	    {"manager-port", 1, 0, '8'},
 	    {"pcap-command", 1, 0, 'a'},
+	    {"pcap-thread", 0, 0, 'T'},
 	    {0, 0, 0, 0}
 	};
 
@@ -511,7 +538,7 @@ int main(int argc, char *argv[]) {
 	/* command line arguments overrides configuration in voipmonitor.conf file */
 	while(1) {
 		int c;
-		c = getopt_long(argc, argv, "f:i:r:d:v:h:b:t:u:p:P:kncUSRAWGX", long_options, &option_index);
+		c = getopt_long(argc, argv, "f:i:r:d:v:h:b:t:u:p:P:kncUSRAWGXT", long_options, &option_index);
 		//"i:r:d:v:h:b:u:p:fnU", NULL, NULL);
 		if (c == -1)
 			break;
@@ -524,6 +551,9 @@ int main(int argc, char *argv[]) {
 			*/
 			case 'a':
 				strncpy(pcapcommand, optarg, sizeof(pcapcommand));
+				break;
+			case 'T':
+				opt_pcap_threaded = 1;
 				break;
 			case '1':
 				opt_gzipGRAPH = 1;
@@ -664,9 +694,14 @@ int main(int argc, char *argv[]) {
 				"      save REGISTER messages\n"
 				"\n"
 				" --ring-buffer\n"
-				"      Set ring buffer in MB (feature of newer >= 2.6.31 kernels). If you see voipmonitor dropping packets in syslog\n"
-				"      upgrade to newer kernel and increase --ring-buffer to higher MB. It is buffer between pcap library and voipmonitor.\n"
-				"      The most reason why voipmonitor drops packets is waiting for I/O operations (switching to ext4 from ext3 also helps.\n"
+				"      Set ring buffer in MB (feature of newer >= 2.6.31 kernels and libpcap >= 1.0.0). If you see voipmonitor dropping\n"
+				"      packets in syslog upgrade to newer kernel and increase --ring-buffer to higher MB or enable --pcap-thread.\n"
+				"      Ring-buffer is between kernel and pcap library. The most top reason why voipmonitor drops packets is waiting for I/O\n"
+				"      operations or it consumes 100%% CPU.\n"
+				"\n"
+				" --pcap-thread\n"
+				"      Read packet from kernel in one thread and process packet in another thread. Packets are copied to non-blocking queue\n"
+				"      use this option if voipmonitor is dropping packets (you can see it in syslog). You can Use this option with --ring-buffer\n"
 				"\n"
 				" -c, --no-cdr\n"
 				"      do no save CDR to MySQL database.\n"
@@ -784,10 +819,13 @@ int main(int argc, char *argv[]) {
 		}
 
 		if((status = pcap_activate(handle)) != 0) {
-			fprintf(stderr, "error pcap_activate\n");
+			fprintf(stderr, "libpcap error: [%s]\n", pcap_geterr(handle));
 			return(2);
 		}
 	} else {
+		// if reading file
+		rtp_threaded = 0;
+		opt_pcap_threaded = 0; //disable threading because it is useless while reading packets from file
 		printf("Reading file: %s\n", fname);
 		mask = PCAP_NETMASK_UNKNOWN;
 		handle = pcap_open_offline(fname, errbuf);
@@ -847,6 +885,36 @@ int main(int argc, char *argv[]) {
 
 	// start manager thread 	
 	pthread_create(&manager_thread, NULL, manager_server, NULL);
+
+	// start reading threads
+	if(rtp_threaded) {
+		threads = new read_thread();
+		for(int i = 0; i < num_threads; i++) {
+#ifdef QUEUE_MUTEX
+			pthread_mutex_init(&(threads[i].qlock), NULL);
+			sem_init(&(threads[i].semaphore), 0, 0);
+#endif
+
+#ifdef QUEUE_NONBLOCK
+			threads[i].pqueue = NULL;
+			queue_new(&(threads[i].pqueue), 10000);
+#endif
+
+			pthread_create(&(threads[i].thread), NULL, rtp_read_thread_func, (void*)&threads[i]);
+		}
+	}
+	if(opt_pcap_threaded) {
+#ifdef QUEUE_MUTEX
+		pthread_mutex_init(&readpacket_thread_queue_lock, NULL);
+		sem_init(&readpacket_thread_semaphore, 0, 0);
+#endif
+
+#ifdef QUEUE_NONBLOCK
+		queue_new(&qs_readpacket_thread_queue, 100000);
+		pthread_create(&pcap_read_thread, NULL, pcap_read_thread_func, NULL);
+#endif
+	}
+
 	// start reading packets
 //	readdump_libnids(handle);
 	readdump_libpcap(handle);

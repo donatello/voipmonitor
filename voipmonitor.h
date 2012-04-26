@@ -3,10 +3,23 @@
  * the GNU General Public License Version 2.
 */
 
-#define RTPSENSOR_VERSION "3.1"
+#ifndef VOIPMONITOR_H
+
+#define RTPSENSOR_VERSION "4.0"
 #define NAT
 
 #define FORMAT_WAV	1
 #define FORMAT_OGG	2
 
+/* choose what method wil be used to synchronize threads. NONBLOCK is the fastest. Do not enable both at once */
+#define QUEUE_NONBLOCK 
+//#define QUEUE_MUTEX 
+
+/* if you want to see all new calls in syslog enable DEBUG_INVITE */
+//#define DEBUG_INVITE
+
 void reload_config();
+
+#define VOIPMONITOR_H
+#endif
+

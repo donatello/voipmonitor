@@ -23,6 +23,7 @@ and insert them into Call class.
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
 #include <syslog.h>
+#include <semaphore.h>
 
 #include <pcap.h>
 //#include <pcap/sll.h>
@@ -42,12 +43,19 @@ and insert them into Call class.
 #include "filter_mysql.h"
 #include "hash.h"
 
+extern "C" {
+#include "liblfds.6/inc/liblfds.h"
+}
+
 using namespace std;
 
 #define MAX(x,y) ((x) > (y) ? (x) : (y))
 #define MIN(x,y) ((x) < (y) ? (x) : (y))
 
-#define DEBUG_INVITE 1
+#ifdef	MUTEX_THREAD
+queue<pcap_packet*> readpacket_thread_queue;
+extern pthread_mutex_t readpacket_thread_queue_lock;
+#endif
 
 Calltable *calltable;
 extern int calls;
@@ -64,6 +72,7 @@ extern int opt_rtp_firstleg;
 extern int opt_sip_register;
 extern char *sipportmatrix;
 extern pcap_t *handle;
+extern read_thread *threads;
 
 extern IPfilter *ipfilter;
 extern IPfilter *ipfilter_reload;
@@ -72,6 +81,13 @@ extern int ipfilter_reload_do;
 extern TELNUMfilter *telnumfilter;
 extern TELNUMfilter *telnumfilter_reload;
 extern int telnumfilter_reload_do;
+
+extern int rtp_threaded;
+extern int opt_pcap_threaded;
+
+#ifdef QUEUE_MUTEX
+extern sem_t readpacket_thread_semaphore;
+#endif
 
 struct tcp_stream2 {
 	char *data;
@@ -86,6 +102,8 @@ struct tcp_stream2 {
 
 tcp_stream2 *tcp_streams_hashed[MAX_TCPSTREAMS];
 list<tcp_stream2*> tcp_streams_list;
+
+extern struct queue_state *qs_readpacket_thread_queue;
 
 /* save packet into file */
 void save_packet(Call *call, struct pcap_pkthdr *header, const u_char *packet) {
@@ -105,21 +123,28 @@ char * gettag(const void *ptr, unsigned long len, const char *tag, unsigned long
 	tl = strlen(tag);
 	r = (unsigned long)memmem(ptr, len, tag, tl);
 	if(r == 0){
+		// tag did not match
 		l = 0;
 	} else {
+		//tag matches move r pointer behind the tag name
 		r += tl;
 		l = (unsigned long)memmem((void *)r, len - (r - (unsigned long)ptr), "\r\n", 2);
 		if (l > 0){
+			// remove trailing \r\n and set l to length of the tag
 			l -= r;
 		} else {
+			// trailing \r\n not found
 			l = 0;
 		}
 	}
-	rc = (char*)r;
-	if (rc) {
-		while (rc[0] == ' '){
-			rc++;
-			l--;
+	// left trim spacees
+	if(l > 0) {
+		rc = (char*)r;
+		if (rc) {
+			while (((char *)ptr + len) > rc && rc[0] == ' '){
+				rc++;
+				l--;
+			}
 		}
 	}
 	*gettaglen = l;
@@ -205,6 +230,7 @@ int get_ip_port_from_sdp(char *sdp_text, in_addr_t *addr, unsigned short *port){
 	char *s;
 	char s1[20];
 	s=gettag(sdp_text,strlen(sdp_text), "c=IN IP4 ", &l);
+	if(l == 0) return 1;
 	memset(s1, '\0', sizeof(s1));
 	memcpy(s1, s, MIN(l, 19));
 	if ((int32_t)(*addr = inet_addr(s1)) == -1){
@@ -272,8 +298,69 @@ int get_rtpmap_from_sdp(char *sdp_text, unsigned long len, int *rtpmap){
 	 return 0;
 }
 
+void add_to_rtp_thread_queue(Call *call, unsigned char *data, int datalen, struct pcap_pkthdr *header,  u_int32_t saddr, unsigned short port, int iscaller) {
+	rtp_packet *rtpp = (rtp_packet*)malloc(sizeof(rtp_packet));
+	rtpp->call = call;
+	rtpp->data = (unsigned char *)malloc(sizeof(unsigned char) * datalen);
+	rtpp->datalen = datalen;
+	rtpp->saddr = saddr;
+	rtpp->port = port;
+	rtpp->iscaller = iscaller;
+
+	memcpy(&rtpp->header, header, sizeof(struct pcap_pkthdr));
+	memcpy(rtpp->data, data, datalen);
+
+#ifdef QUEUE_MUTEX
+	pthread_mutex_lock(&(threads[call->thread_num].qlock));
+	threads[call->thread_num].pqueue.push(rtpp);
+	pthread_mutex_unlock(&(threads[call->thread_num].qlock));
+	sem_post(&threads[call->thread_num].semaphore);
+#endif
+
+#ifdef QUEUE_NONBLOCK
+	if(queue_enqueue(threads[call->thread_num].pqueue, (void*)rtpp) == 0) {
+		// enqueue failed, try to raise queue
+		if(queue_guaranteed_enqueue(threads[call->thread_num].pqueue, (void*)rtpp) == 0) {
+			syslog(LOG_ERR, "error: add_to_rtp_thread_queue cannot allocate memory");
+		}
+	}
+#endif
+}
+
+
+void *rtp_read_thread_func(void *arg) {
+	rtp_packet *rtpp;
+	read_thread *params = (read_thread*)arg;
+	while(1) {
+
+#ifdef QUEUE_MUTEX
+		sem_wait(&params->semaphore);
+
+		pthread_mutex_lock(&(params->qlock));
+		rtpp = params->pqueue.front();
+		params->pqueue.pop();
+		pthread_mutex_unlock(&(params->qlock));
+#endif
+		
+#ifdef QUEUE_NONBLOCK
+		if(queue_dequeue(params->pqueue, (void **)&rtpp) != 1) {
+			// queue is empty
+			usleep(10000);
+			continue;
+		};
+#endif 
+		rtpp->call->read_rtp(rtpp->data, rtpp->datalen, &rtpp->header, rtpp->saddr, rtpp->port, rtpp->iscaller);
+		rtpp->call->set_last_packet_time(rtpp->header.ts.tv_sec);
+
+		free(rtpp->data);
+		free(rtpp);
+	}
+
+	return NULL;
+}
+
 Call *process_packet(unsigned int saddr, int source, unsigned int daddr, int dest, char *data, int datalen,
-	pcap_t *handle, pcap_pkthdr *header, const u_char *packet, int istcp, int dontsave) {
+	pcap_t *handle, pcap_pkthdr *header, const u_char *packet, int istcp, int dontsave, int can_thread, int *was_rtp) {
 
 	static Call *call;
 	static int iscaller;
@@ -291,6 +378,8 @@ Call *process_packet(unsigned int saddr, int source, unsigned int daddr, int des
 	static unsigned int lostpacket = 0;
 	static unsigned int lostpacketif = 0;
 
+	*was_rtp = 0;
+
 	// checking and cleaning stuff every 10 seconds (if some packet arrive) 
 	if (header->ts.tv_sec - last_cleanup > 10){
 		if(verbosity > 0) printf("Total calls [%d] calls in queue[%d]\n", (int)calltable->calls_listMAP.size(), (int)calltable->calls_queue.size());
@@ -301,7 +390,7 @@ Call *process_packet(unsigned int saddr, int source, unsigned int daddr, int des
 		pcapstatres = pcap_stats(handle, &ps);
 		if (pcapstatres == 0 && (lostpacket < ps.ps_drop || lostpacketif < ps.ps_ifdrop)) {
 			if(pcapstatresCount) {
-				syslog(LOG_ERR, "error: libpcap or interface dropped some packets! rx:%i drop:%i ifdrop:%i increase --ring-buffer (kernel >= 2.6.31 needed)\n", ps.ps_recv, ps.ps_drop, ps.ps_ifdrop);
+				syslog(LOG_ERR, "error: libpcap or interface dropped some packets! rx:%i pcapdrop:%i ifdrop:%i increase --ring-buffer (kernel >= 2.6.31 needed and libpcap >= 1.0.0) or use --pcap-thread\n", ps.ps_recv, ps.ps_drop, ps.ps_ifdrop);
 			} else {
 				// do not show first error, it is normal on startup. 
 				pcapstatresCount++;
@@ -351,11 +440,17 @@ Call *process_packet(unsigned int saddr, int source, unsigned int daddr, int des
 		}
 		// packet (RTP) by destination:port is already part of some stored call 
 		if(!dontsave && is_rtcp && (opt_saveRTP || opt_saveRTCP)) {
+			// RTCP is only saved
 			save_packet(call, header, packet);
 			return call;
 		}
-		call->read_rtp((unsigned char*) data, datalen, header, saddr, source, iscaller);
-		call->set_last_packet_time(header->ts.tv_sec);
+		if(rtp_threaded && can_thread) {
+			add_to_rtp_thread_queue(call, (unsigned char*) data, datalen, header, saddr, source, iscaller);
+			*was_rtp = 1;
+		} else {
+			call->read_rtp((unsigned char*) data, datalen, header, saddr, source, iscaller);
+			call->set_last_packet_time(header->ts.tv_sec);
+		}
 		if(!dontsave && call->flags & FLAG_SAVERTP) {
 			save_packet(call, header, packet);
 		}
@@ -372,8 +467,13 @@ Call *process_packet(unsigned int saddr, int source, unsigned int daddr, int des
 			return call;
 		}
 		// as we are searching by source address and find some call, revert iscaller 
-		call->read_rtp((unsigned char*) data, datalen, header, saddr, source, !iscaller);
-		call->set_last_packet_time(header->ts.tv_sec);
+		if(rtp_threaded && can_thread) {
+			add_to_rtp_thread_queue(call, (unsigned char*) data, datalen, header, saddr, source, !iscaller);
+			*was_rtp = 1;
+		} else {
+			call->read_rtp((unsigned char*) data, datalen, header, saddr, source, !iscaller);
+			call->set_last_packet_time(header->ts.tv_sec);
+		}
 		if(!dontsave && call->flags & FLAG_SAVERTP) {
 			save_packet(call, header, packet);
 		}
@@ -449,8 +549,9 @@ Call *process_packet(unsigned int saddr, int source, unsigned int daddr, int des
 							memcpy(newdata + len2, tmpstream->data, tmpstream->datalen);
 							len2 += tmpstream->datalen;
 						};
-						// process SIP packet
-						Call *call = process_packet(saddr, source, daddr, dest, (char*)newdata, newlen, handle, header, packet, 0, 1);
+						// process SIP packet but disable to process by thread because we are freeing newdata and need to guarantee right order
+						int tmp_was_rtp;
+						Call *call = process_packet(saddr, source, daddr, dest, (char*)newdata, newlen, handle, header, packet, 0, 1, 0, &tmp_was_rtp);
 						// remove TCP stream
 						free(newdata);
 						tcp_stream2 *next;
@@ -615,6 +716,9 @@ Call *process_packet(unsigned int saddr, int source, unsigned int daddr, int des
 				call->type = sip_method;
 				ipfilter->add_call_flags(&(call->flags), ntohl(saddr), ntohl(daddr));
 				strcpy(call->fbasename, callidstr);
+#ifdef DEBUG_INVITE
+				syslog(LOG_NOTICE, "New call: srcip INET_NTOA[%u] dstip INET_NTOA[%u] From[%s] To[%s]\n", call->sipcallerip, call->sipcalledip, call->caller, call->called);
+#endif
 
 				/* this logic updates call on the first INVITES */
 				if (sip_method == INVITE) {
@@ -636,9 +740,6 @@ Call *process_packet(unsigned int saddr, int source, unsigned int daddr, int des
 					}
 					call->seeninvite = true;
 					telnumfilter->add_call_flags(&(call->flags), call->caller, call->called);
-#ifdef DEBUG_INVITE
-					syslog(LOG_NOTICE, "New call: srcip INET_NTOA[%u] dstip INET_NTOA[%u] From[%s] To[%s]\n", call->sipcallerip, call->sipcalledip, call->caller, call->called);
-#endif
 				}
 
 				// opening dump file
@@ -949,7 +1050,8 @@ libnids_tcp_callback(struct tcp_stream *a_tcp, void **this_time_not_needed) {
 #ifdef HAS_NIDS
 void
 libnids_udp_callback(struct tuple4 *addr, u_char *data, int len, struct ip *pkt) {
-	process_packet(addr->saddr, addr->source, addr->daddr, addr->dest, (char*)data, len, handle, nids_last_pcap_header, nids_last_pcap_data, 0, 0);
+	int was_rtp;
+	process_packet(addr->saddr, addr->source, addr->daddr, addr->dest, (char*)data, len, handle, nids_last_pcap_header, nids_last_pcap_data, 0, 0, 1, &was_rtp);
 	return;
 }
 
@@ -1005,6 +1107,71 @@ void readdump_libnids(pcap_t *handle) {
 }
 #endif
 
+void *pcap_read_thread_func(void *arg) {
+	pcap_packet *pp;
+	struct iphdr *header_ip;
+	struct udphdr *header_udp;
+	struct udphdr header_udp_tmp;
+	struct tcphdr *header_tcp;
+	char *data;
+	int datalen;
+	int istcp = 0;
+	int res;
+	int was_rtp;
+	while(1) {
+
+#ifdef QUEUE_MUTEX
+		res = sem_wait(&readpacket_thread_semaphore);
+		if(res != 0) {
+			printf("Error pcap_read_thread_func sem_wait returns != 0\n");
+		}
+
+		pthread_mutex_lock(&readpacket_thread_queue_lock);
+		pp = readpacket_thread_queue.front();
+		readpacket_thread_queue.pop();
+		pthread_mutex_unlock(&readpacket_thread_queue_lock);
+#endif
+
+#ifdef QUEUE_NONBLOCK
+		if((res = queue_dequeue(qs_readpacket_thread_queue, (void **)&pp)) != 1) {
+			// queue is empty
+			usleep(10000);
+			continue;
+		};
+#endif
+
+		header_ip = (struct iphdr *) ((char*)pp->packet + pp->offset);
+		header_udp = &header_udp_tmp;
+		if (header_ip->protocol == IPPROTO_UDP) {
+			// prepare packet pointers 
+			header_udp = (struct udphdr *) ((char *) header_ip + sizeof(*header_ip));
+			data = (char *) header_udp + sizeof(*header_udp);
+			datalen = (int)(pp->header.len - ((unsigned long) data - (unsigned long) pp->packet)); 
+			istcp = 0;
+		} else if (header_ip->protocol == IPPROTO_TCP) {
+			istcp = 1;
+			// prepare packet pointers 
+			header_tcp = (struct tcphdr *) ((char *) header_ip + sizeof(*header_ip));
+			data = (char *) header_tcp + (header_tcp->doff * 4);
+			datalen = (int)(pp->header.len - ((unsigned long) data - (unsigned long) pp->packet)); 
+
+			header_udp->source = header_tcp->source;
+			header_udp->dest = header_tcp->dest;
+		} else {
+			//packet is not UDP and is not TCP, we are not interested, go to the next packet
+			continue;
+		}
+
+		process_packet(header_ip->saddr, htons(header_udp->source), header_ip->daddr, htons(header_udp->dest), 
+			    data, datalen, handle, &pp->header, pp->packet, istcp, 0, 1, &was_rtp);
+
+		free(pp->packet);
+		free(pp);
+	}
+
+	return NULL;
+}
+
 void readdump_libpcap(pcap_t *handle) {
 	struct pcap_pkthdr *header;	// The header that pcap gives us
 	const u_char *packet = NULL;		// The actual packet 
@@ -1021,6 +1188,7 @@ void readdump_libpcap(pcap_t *handle) {
 	unsigned int offset;
 	int pcap_dlink = pcap_datalink(handle);
 	int istcp = 0;
+	int was_rtp;
 
 	init_hash();
 	memset(tcp_streams_hashed, 0, sizeof(tcp_stream2*) * MAX_TCPSTREAMS);
@@ -1138,12 +1306,41 @@ void readdump_libpcap(pcap_t *handle) {
 			continue;
 		}
 
-
 		if(datalen < 0) {
 			continue;
 		}
-		
+
+		if(opt_pcap_threaded) {
+			//add packet to queue
+			pcap_packet *pp = (pcap_packet*)malloc(sizeof(pcap_packet));
+			pp->packet = (u_char*)malloc(sizeof(u_char) * header->len);
+			pp->offset = offset;
+			memcpy(&pp->header, header, sizeof(struct pcap_pkthdr));
+			memcpy(pp->packet, packet, header->len);
+			if(header->caplen > header->len) {
+				syslog(LOG_ERR, "error: header->caplen > header->len FIX!");
+			}
+
+#ifdef QUEUE_MUTEX
+			pthread_mutex_lock(&readpacket_thread_queue_lock);
+			readpacket_thread_queue.push(pp);
+			pthread_mutex_unlock(&readpacket_thread_queue_lock);
+#endif
+
+#ifdef QUEUE_NONBLOCK
+			if(queue_enqueue(qs_readpacket_thread_queue, (void*)pp) == 0) {
+				// enqueue failed, try to raise queue
+				if(queue_guaranteed_enqueue(qs_readpacket_thread_queue, (void*)pp) == 0) {
+					syslog(LOG_ERR, "error: readpacket_queue cannot allocate memory");
+				}
+			}
+#endif 
+
+			//sem_post(&readpacket_thread_semaphore);
+			continue;
+		}
+
 		process_packet(header_ip->saddr, htons(header_udp->source), header_ip->daddr, htons(header_udp->dest), 
-			    data, datalen, handle, header, packet, istcp, 0);
+			    data, datalen, handle, header, packet, istcp, 0, 1, &was_rtp);
 	}
 }
