@@ -1571,7 +1571,7 @@ int main(int argc, char *argv[]) {
 
 	if(opt_scanpcapdir[0] != '\0') {
 		// scan directory opt_scanpcapdir (typically /dev/shm/voipmonitor
-		char filename[32];
+		char filename[256];
 		unsigned int tmp = 0;
 		unsigned int min = 0 - 1;
 		unsigned int max = 0;
@@ -1605,14 +1605,16 @@ int main(int argc, char *argv[]) {
 				}
 			}
 			closedir(dirp);
+			//printf("min=%u max=%u %d\n", min, max, sizeof(min));
 			for(i = min; i < max; i++) {
 				if(terminating) {
 					break;
 				}
 				snprintf(filename, sizeof(filename), "%s/%u", opt_scanpcapdir, i);
+				//printf("Checking if file %s exists.\n", filename);
 				if(!file_exists(filename)) continue;
 				// if reading file
-				//printf("Reading file: %s\n", filename);
+				printf("Reading file: %s\n", filename);
 				mask = PCAP_NETMASK_UNKNOWN;
 				handle = pcap_open_offline(filename, errbuf);
 				if(handle == NULL) {
