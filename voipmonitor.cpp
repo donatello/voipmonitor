@@ -1508,7 +1508,7 @@ int main(int argc, char *argv[]) {
 
 	if(opt_scanpcapdir[0] != '\0') {
 		// scan directory opt_scanpcapdir (typically /dev/shm/voipmonitor
-		char filename[32];
+		char filename[256];
 		unsigned int tmp = 0;
 		unsigned int min = 0 - 1;
 		unsigned int max = 0;
